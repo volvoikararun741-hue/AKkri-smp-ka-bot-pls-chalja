@@ -14,7 +14,7 @@ const https = require("https");
 // ============================================================
 const app = express();
 app.use(express.json());
-const PORT = process.env.PORT || 5000;
+const PORT = Number(process.env.PORT) || 5000;
 
 // Bot state tracking
 let botState = {
@@ -979,6 +979,10 @@ app.post("/start", (req, res) => {
   if (botRunning) return res.json({ success: false, msg: "Already running" });
 
   botRunning = true;
+  // Reset any stale reconnect state so the manual start always goes through
+  clearBotTimeouts();
+  isReconnecting = false;
+  botState.reconnectAttempts = 0;
   createBot();
   addLog("[Control] Bot started");
 
@@ -990,11 +994,23 @@ app.post("/stop", (req, res) => {
 
   botRunning = false;
 
+  // Cancel any pending reconnect so the bot really stays stopped
+  clearBotTimeouts();
+  isReconnecting = false;
+
   if (bot) {
-    bot.end();
+    const oldBot = bot;
     bot = null;
+    try {
+      oldBot.removeAllListeners();
+      oldBot.on("error", () => {}); // swallow late socket errors
+      oldBot.end();
+    } catch (e) {
+      addLog(`[Control] Error ending bot: ${e.message}`);
+    }
   }
 
+  botState.connected = false;
   clearAllIntervals();
   addLog("[Control] Bot stopped");
 
@@ -1080,7 +1096,7 @@ function formatUptime(seconds) {
   const h = Math.floor(seconds / 3600);
   const m = Math.floor((seconds % 3600) / 60);
   const s = seconds % 60;
-  return `${h}h ${m}m ${s} s`;
+  return `${h}h ${m}m ${s}s`;
 }
 
 // ============================================================
@@ -1195,11 +1211,17 @@ function createBot() {
     clearAllIntervals();
     try {
       bot.removeAllListeners();
+      bot.on("error", () => {}); // avoid unhandled 'error' after listeners are removed
       bot.end();
     } catch (e) {
-      addLog("[Cleanup] Error ending previous bot:", e.message);
+      addLog(`[Cleanup] Error ending previous bot: ${e.message}`);
     }
     bot = null;
+  }
+
+  if (!botRunning) {
+    addLog("[Bot] Bot is stopped - not creating instance");
+    return;
   }
 
   addLog(`[Bot] Creating bot instance...`);
@@ -1232,6 +1254,7 @@ function createBot() {
         addLog("[Bot] Connection timeout - no spawn received");
         try {
           bot.removeAllListeners();
+          bot.on("error", () => {});
           bot.end();
         } catch (e) {
           /* ignore */
@@ -1251,6 +1274,7 @@ function createBot() {
       clearBotTimeouts();
       botState.connected = true;
       botState.lastActivity = Date.now();
+      botState.startTime = Date.now(); // uptime = time since last connection
       botState.reconnectAttempts = 0;
       isReconnecting = false;
 
@@ -1370,6 +1394,12 @@ function createBot() {
 function scheduleReconnect() {
   clearBotTimeouts();
 
+  // Respect the dashboard "Stop" button
+  if (!botRunning) {
+    addLog("[Bot] Bot is stopped - reconnect skipped");
+    return;
+  }
+
   // FIX: don't stack reconnect if already waiting
   if (isReconnecting) {
     addLog("[Bot] Reconnect already scheduled, skipping duplicate.");
@@ -1417,17 +1447,10 @@ function initializeModules(bot, mcData, defaultMove) {
     bot.on("messagestr", (message) => {
       if (authHandled) return;
       const msg = message.toLowerCase();
-      if (
-        msg.includes("/register") ||
-        msg.includes("register ") ||
-        msg.includes("지정된 비밀번호")
-      ) {
+      // Only react to the server's slash-command prompts, not ordinary player chat
+      if (msg.includes("/register") || msg.includes("지정된 비밀번호")) {
         tryAuth("register");
-      } else if (
-        msg.includes("/login") ||
-        msg.includes("login ") ||
-        msg.includes("로그인")
-      ) {
+      } else if (msg.includes("/login") || msg.includes("로그인")) {
         tryAuth("login");
       }
     });
@@ -1567,7 +1590,7 @@ function initializeModules(bot, mcData, defaultMove) {
             );
             botState.lastActivity = Date.now();
           } catch (e) {
-            addLog("[AntiAFK] Walk error:", e.message);
+            addLog(`[AntiAFK] Walk error: ${e.message}`);
           }
         },
         120000 + Math.floor(Math.random() * 360000),
@@ -1656,7 +1679,7 @@ function startCircleWalk(bot, defaultMove) {
       angle += Math.PI / 4;
       botState.lastActivity = Date.now();
     } catch (e) {
-      addLog("[CircleWalk] Error:", e.message);
+      addLog(`[CircleWalk] Error: ${e.message}`);
     }
   }, config.movement["circle-walk"].speed);
 }
@@ -1677,7 +1700,7 @@ function startRandomJump(bot) {
       }, 300);
       botState.lastActivity = Date.now();
     } catch (e) {
-      addLog("[RandomJump] Error:", e.message);
+      addLog(`[RandomJump] Error: ${e.message}`);
     }
   }, config.movement["random-jump"].interval);
 }
@@ -1691,7 +1714,7 @@ function startLookAround(bot) {
       bot.look(yaw, pitch, false);
       botState.lastActivity = Date.now();
     } catch (e) {
-      addLog("[LookAround] Error:", e.message);
+      addLog(`[LookAround] Error: ${e.message}`);
     }
   }, config.movement["look-around"].interval);
 }
@@ -1730,7 +1753,7 @@ function avoidMobs(bot) {
         }
       }
     } catch (e) {
-      addLog("[AvoidMobs] Error:", e.message);
+      addLog(`[AvoidMobs] Error: ${e.message}`);
     }
   }, 2000);
 }
@@ -1785,27 +1808,34 @@ function combatModule(bot, mcData) {
         lastAttackTime = now;
       }
     } catch (e) {
-      addLog("[Combat] Error:", e.message);
+      addLog(`[Combat] Error: ${e.message}`);
     }
   });
 
   // FIX: autoEat - check foodPoints property on the item directly (works reliably)
+  let isEating = false;
   bot.on("health", () => {
-    if (!config.combat["auto-eat"]) return;
+    if (!config.combat["auto-eat"] || isEating) return;
     try {
       if (bot.food < 14) {
+        // Inventory items have no foodPoints field - look the item up in minecraft-data
         const food = bot.inventory
           .items()
-          .find((i) => i.foodPoints && i.foodPoints > 0);
+          .find((i) => mcData.foods && mcData.foods[i.type]);
         if (food) {
+          isEating = true;
           bot
             .equip(food, "hand")
             .then(() => bot.consume())
-            .catch((e) => addLog("[AutoEat] Error:", e.message));
+            .catch((e) => addLog(`[AutoEat] Error: ${e.message}`))
+            .finally(() => {
+              isEating = false;
+            });
         }
       }
     } catch (e) {
-      addLog("[AutoEat] Error:", e.message);
+      isEating = false;
+      addLog(`[AutoEat] Error: ${e.message}`);
     }
   });
 }
@@ -1845,7 +1875,7 @@ function bedModule(bot, mcData) {
       }
     } catch (e) {
       isTryingToSleep = false;
-      addLog("[Bed] Error:", e.message);
+      addLog(`[Bed] Error: ${e.message}`);
     }
   }, 10000);
 }
@@ -1869,7 +1899,7 @@ function chatModule(bot) {
 
       if (config.chat && config.chat.respond) {
         const lowerMsg = message.toLowerCase();
-        if (lowerMsg.includes("hello") || lowerMsg.includes("hi")) {
+        if (/\b(hello|hi)\b/.test(lowerMsg)) {
           bot.chat(`Hello, ${username}!`);
         }
         if (message.startsWith("!tp ")) {
@@ -1878,7 +1908,7 @@ function chatModule(bot) {
         }
       }
     } catch (e) {
-      addLog("[Chat] Error:", e.message);
+      addLog(`[Chat] Error: ${e.message}`);
     }
   });
 }
@@ -2054,13 +2084,23 @@ process.on("unhandledRejection", (reason) => {
   }
 });
 
-process.on("SIGTERM", () => {
-  addLog("[System] SIGTERM received — ignoring, bot will stay alive.");
-});
+function shutdown(signal) {
+  addLog(`[System] ${signal} received - shutting down.`);
+  botRunning = false;
+  clearBotTimeouts();
+  clearAllIntervals();
+  try {
+    if (bot) {
+      bot.removeAllListeners();
+      bot.on("error", () => {});
+      bot.end();
+    }
+  } catch (_) {}
+  process.exit(0);
+}
 
-process.on("SIGINT", () => {
-  addLog("[System] SIGINT received — ignoring, bot will stay alive.");
-});
+process.on("SIGTERM", () => shutdown("SIGTERM"));
+process.on("SIGINT", () => shutdown("SIGINT"));
 
 // =============================
 //===============================
